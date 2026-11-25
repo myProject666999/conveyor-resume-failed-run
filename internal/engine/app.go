@@ -189,18 +189,78 @@ func (ec *EngineContext) consumePipelineEvents(msg jetstream.Msg) {
 			log.Printf("Failed to dispatch first step '%s' for run '%s': %v", firstStep.Name, event.RunID, err)
 			if event.Event == "delete" {
 				_ = ec.ResourceModel.MarkDeletionFailed(event.Resource.Name, event.Resource.Resource)
+			} else {
+				_ = ec.ResourceModel.MarkPipelineFailure(event.Resource.Name, event.Resource.Resource, event.RunID, firstStep.ID, "failed to dispatch first step: "+err.Error())
 			}
 			return
 		}
+
+	case "pipelines.pipeline.resume":
+		ec.handleResumePipelineRun(event, current, pipeline)
 	default:
 		log.Println("Unhandled pipeline event subject: ", subject)
 	}
 
 }
 
+// handleResumePipelineRun re-dispatches the first untrusted step of a resumed
+// run. PreparePipelineResume already rewrote the metadata and kept trusted
+// results, so this only validates the run and publishes the driver message.
+func (ec *EngineContext) handleResumePipelineRun(event PipelineEvent, current types.Resource, pipeline *types.Pipeline) {
+	if current.Metadata["current_pipeline_run"] != event.RunID {
+		log.Printf("Ignoring stale resume event for run '%s' (resource '%s')", event.RunID, current.Name)
+		return
+	}
+	stepID, ok := current.Metadata["current_pipeline_step"].(string)
+	if !ok || stepID == "" {
+		log.Printf("Resume event for run '%s' has no current step", event.RunID)
+		return
+	}
+	var step *types.Step
+	for i := range pipeline.Steps {
+		if pipeline.Steps[i].ID == stepID {
+			step = &pipeline.Steps[i]
+			break
+		}
+	}
+	if step == nil {
+		log.Printf("Resume step '%s' no longer exists in pipeline '%s'", stepID, pipeline.Name)
+		_ = ec.ResourceModel.MarkPipelineFailure(current.Name, current.Resource, event.RunID, stepID, "resume step no longer exists in pipeline definition")
+		return
+	}
+	operation, ok := current.Metadata["current_pipeline_event"].(string)
+	if !ok || operation == "" {
+		log.Printf("Resume event for run '%s' is missing its operation", event.RunID)
+		return
+	}
+
+	mID, err := utils.GenerateRandomID()
+	if err != nil {
+		log.Println("Error generating driver message ID: ", err)
+		return
+	}
+	resourceJson, err := json.Marshal(current)
+	if err != nil {
+		log.Println("Error marshaling resource: ", err)
+		return
+	}
+	driverMessage := types.DriverMessage{
+		Event:   operation,
+		RunID:   event.RunID,
+		Payload: string(resourceJson),
+		ID:      mID,
+	}
+	subject := "drivers." + step.Driver + ".resources." + current.Resource
+	if err := ec.publishEvent(subject, driverMessage); err != nil {
+		log.Printf("Failed to dispatch resumed step '%s' for run '%s': %v", step.Name, event.RunID, err)
+		_ = ec.ResourceModel.MarkPipelineFailure(current.Name, current.Resource, event.RunID, step.ID, "failed to dispatch resumed step: "+err.Error())
+		return
+	}
+	log.Printf("Resumed run '%s' at step '%s' for resource '%s'", event.RunID, step.Name, current.Name)
+}
+
 // publishEvent publishes an event to driver
 func (ec *EngineContext) publishEvent(subject string, message types.DriverMessage) error {
-
 	jsonMsg, merr := json.Marshal(message)
 	if merr != nil {
 		return merr
@@ -248,8 +308,14 @@ func (ec *EngineContext) handleProcessDriverResult(event PipelineEvent, pipeline
 		return
 	}
 
-	// save driver result to resource metadata
-	err = ec.ResourceModel.SaveDriverResult(event.Resource.Name, event.Resource.Resource, event.DriverResultEvent.Driver, event.DriverResultEvent)
+	// Save the driver result. Successful non-deletion steps also record an
+	// ordered result plus a signature so a resume can keep trusted prefix work.
+	isDeletion := event.Event == "delete"
+	if event.DriverResultEvent.Success && !isDeletion {
+		err = ec.ResourceModel.RecordStepResult(event.Resource.Name, event.Resource.Resource, currentStepID, event.DriverResultEvent.Driver, event.DriverResultEvent)
+	} else {
+		err = ec.ResourceModel.SaveDriverResult(event.Resource.Name, event.Resource.Resource, event.DriverResultEvent.Driver, event.DriverResultEvent)
+	}
 	if err != nil {
 		log.Println("Error saving driver result: ", err)
 		return
@@ -283,6 +349,9 @@ func (ec *EngineContext) handleProcessDriverResult(event PipelineEvent, pipeline
 	}
 	if !event.DriverResultEvent.Success {
 		log.Printf("Pipeline run '%s' stopped at step '%s' for resource '%s': %s", event.RunID, pipeline.Steps[currentStepIndex].Name, event.Resource.Name, event.DriverResultEvent.Message)
+		if err := ec.ResourceModel.MarkPipelineFailure(event.Resource.Name, event.Resource.Resource, event.RunID, currentStepID, event.DriverResultEvent.Message); err != nil {
+			log.Println("Error recording pipeline failure: ", err)
+		}
 		return
 	}
 
@@ -292,6 +361,9 @@ func (ec *EngineContext) handleProcessDriverResult(event PipelineEvent, pipeline
 				log.Println("Deletion cleanup failed: ", err)
 				return
 			}
+		} else if err := ec.ResourceModel.FinishPipelineRun(event.Resource.Name, event.Resource.Resource); err != nil {
+			log.Println("Error finishing pipeline run: ", err)
+			return
 		}
 		log.Printf("Pipeline run '%s' completed for resource '%s'", event.RunID, event.Resource.Name)
 		return
@@ -322,6 +394,8 @@ func (ec *EngineContext) handleProcessDriverResult(event PipelineEvent, pipeline
 		log.Printf("Failed to dispatch step '%s' for run '%s': %v", nextStep.Name, event.RunID, err)
 		if operation == "delete" {
 			_ = ec.ResourceModel.MarkDeletionFailed(event.Resource.Name, event.Resource.Resource)
+		} else {
+			_ = ec.ResourceModel.MarkPipelineFailure(event.Resource.Name, event.Resource.Resource, event.RunID, nextStep.ID, "failed to dispatch next step: "+err.Error())
 		}
 		return
 	}

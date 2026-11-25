@@ -115,3 +115,26 @@ func PublishResourceEvent(
 
 	return run_id, nil
 }
+
+// PublishResumeEvent starts a continued run under a new run id while reusing the
+// original operation (create/update) stored on the resource. The engine keeps
+// already completed step results and re-dispatches from the first untrusted step.
+func PublishResumeEvent(runID string, resource types.Resource, js jetstream.JetStream) error {
+	operation, _ := resource.Metadata["current_pipeline_event"].(string)
+	resourceEvent := PipelineEvent{
+		Event:    operation,
+		RunID:    runID,
+		Resource: resource,
+	}
+	eventJson, err := json.Marshal(resourceEvent)
+	if err != nil {
+		return fmt.Errorf("marshal resume event: %w", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, err := js.Publish(ctx, "pipelines.pipeline.resume", eventJson); err != nil {
+		return fmt.Errorf("publish resume event: %w", err)
+	}
+	return nil
+}

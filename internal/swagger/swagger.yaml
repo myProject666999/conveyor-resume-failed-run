@@ -60,8 +60,9 @@ definitions:
       id:
         type: string
       metadata:
-        additionalProperties:
-          type: string
+        additionalProperties: true
+        description: Metadata can include any additional information about the resource,
+          such as labels, annotations, or other custom fields.
         type: object
       name:
         type: string
@@ -104,7 +105,7 @@ info:
     name: Apache 2.0
     url: https://opensource.org/license/apache-2-0
   title: Conveyor CI API
-  version: 0.5.0
+  version: 0.6.5
 paths:
   /drivers/broadcast-message:
     post:
@@ -680,8 +681,13 @@ paths:
       produces:
       - application/json
       responses:
+        "202":
+          description: Pipeline deletion accepted; poll GET until 404
+          schema:
+            additionalProperties: true
+            type: object
         "204":
-          description: Resource deleted successfully
+          description: Direct resource deleted
           schema:
             type: string
         "400":
@@ -689,6 +695,10 @@ paths:
           schema:
             additionalProperties: true
             type: object
+        "404":
+          description: Resource already absent
+          schema:
+            type: string
         "500":
           description: Internal server error
           schema:
@@ -817,6 +827,55 @@ paths:
             additionalProperties: true
             type: object
       summary: Get a resource by version
+      tags:
+      - resources
+  /resources/{type}/{name}/resume:
+    post:
+      consumes:
+      - application/json
+      description: Continue a resource's failed pipeline run with a new run id, preserving
+        completed step results
+      parameters:
+      - description: Resource type
+        in: path
+        name: type
+        required: true
+        type: string
+      - description: Resource name
+        in: path
+        name: name
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "202":
+          description: Resume accepted; a new run was started
+          schema:
+            additionalProperties: true
+            type: object
+        "400":
+          description: Bad request - Missing parameters
+          schema:
+            additionalProperties: true
+            type: object
+        "404":
+          description: Resource not found
+          schema:
+            additionalProperties: true
+            type: object
+        "409":
+          description: Conflict - no failure, deleting, stale version, or removed
+            step
+          schema:
+            additionalProperties: true
+            type: object
+        "500":
+          description: Internal server error
+          schema:
+            additionalProperties: true
+            type: object
+      summary: Resume a failed pipeline run
       tags:
       - resources
 schemes:

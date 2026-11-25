@@ -23,10 +23,8 @@ type ResourceHandler struct {
 
 func NewResourceHandler(natsContext *utils.NatsContext, db *badger.DB) *ResourceHandler {
 	return &ResourceHandler{
-		NatsContext: natsContext,
-		ResourceModel: &models.ResourceModel{
-			DB: db,
-		},
+		NatsContext:   natsContext,
+		ResourceModel: models.NewResourceModel(db),
 		ResourceDefinitionModel: &models.ResourceDefinitionModel{
 			DB: db,
 		},
@@ -355,6 +353,95 @@ func (h *ResourceHandler) UpdateResource(c *fiber.Ctx) error {
 		RunID:    runid,
 		Resource: r,
 	})
+}
+
+// ResumeResource continues a failed pipeline run from the first step whose
+// result cannot be trusted, reusing a new run id and keeping earlier results.
+// @Summary Resume a failed pipeline run
+// @Description Continue a resource's failed pipeline run with a new run id, preserving completed step results
+// @Tags resources
+// @Accept json
+// @Produce json
+// @Param type path string true "Resource type"
+// @Param name path string true "Resource name"
+// @Success 202 {object} map[string]interface{} "Resume accepted; a new run was started"
+// @Failure 400 {object} map[string]interface{} "Bad request - Missing parameters"
+// @Failure 404 {object} map[string]interface{} "Resource not found"
+// @Failure 409 {object} map[string]interface{} "Conflict - no failure, deleting, stale version, or removed step"
+// @Failure 500 {object} map[string]interface{} "Internal server error"
+// @Router /resources/{type}/{name}/resume [post]
+func (h *ResourceHandler) ResumeResource(c *fiber.Ctx) error {
+	name, resourceType := c.Params("name"), c.Params("type")
+	if name == "" || resourceType == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "Resource name and type are required",
+		})
+	}
+
+	current, err := h.ResourceModel.FindOne(name, resourceType)
+	if errors.Is(err, badger.ErrKeyNotFound) {
+		return c.SendStatus(fiber.StatusNotFound)
+	}
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": fmt.Sprintf("Failed to find resource: %v", err),
+		})
+	}
+	if current.Pipeline == "" {
+		return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+			"error":  "Resource is not associated with a pipeline",
+			"reason": "no_failure",
+		})
+	}
+
+	pipeline, err := h.PipelineModel.GetPipeline(current.Pipeline)
+	if err != nil || pipeline == nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": fmt.Sprintf("Failed to get pipeline: %v", err),
+		})
+	}
+
+	plan, err := h.ResourceModel.PreparePipelineResume(name, resourceType, pipeline)
+	if err != nil {
+		if reason, ok := resumeConflictReason(err); ok {
+			return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+				"error":  err.Error(),
+				"reason": reason,
+			})
+		}
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": fmt.Sprintf("Failed to prepare resume: %v", err),
+		})
+	}
+
+	if err := engine.PublishResumeEvent(plan.RunID, plan.Resource, h.NatsContext.JetStream); err != nil {
+		// Restore a failure marker so the resource stays resumable, mirroring
+		// the rollback used when deletion dispatch fails.
+		_ = h.ResourceModel.MarkPipelineFailure(name, resourceType, plan.RunID, plan.ResumeStepID, "resume dispatch failed: "+err.Error())
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "Could not publish resume event; the resource was retained for retry",
+		})
+	}
+
+	return c.Status(fiber.StatusAccepted).JSON(fiber.Map{
+		"runid":   plan.RunID,
+		"message": "Pipeline run resumed",
+	})
+}
+
+func resumeConflictReason(err error) (string, bool) {
+	switch {
+	case errors.Is(err, models.ErrNoPipelineFailure):
+		return "no_failure", true
+	case errors.Is(err, models.ErrResourceDeleting):
+		return "deleting", true
+	case errors.Is(err, models.ErrFailureVersionStale):
+		return "version_stale", true
+	case errors.Is(err, models.ErrResumeStepRemoved):
+		return "step_removed", true
+	default:
+		return "", false
+	}
 }
 
 // GetResourceByVersion retrieves a specific resource by name, type, and version

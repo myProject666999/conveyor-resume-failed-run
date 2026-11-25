@@ -21,6 +21,68 @@ type resourceLockKey struct {
 	key string
 }
 
+// Metadata keys used to track pipeline execution state.
+const (
+	metaVersion         = "version"
+	metaDriverResults   = "driverresults"
+	metaCurrentRun      = "current_pipeline_run"
+	metaCurrentEvent    = "current_pipeline_event"
+	metaCurrentStep     = "current_pipeline_step"
+	metaPipelineFailure = "pipeline_failure"
+	metaStepSignatures  = "pipeline_step_signatures"
+	metaStepResults     = "pipeline_step_results"
+)
+
+// Sentinel errors for resume validation; handlers map these to 409 responses.
+var (
+	ErrNoPipelineFailure   = errors.New("resource has no pipeline failure to resume")
+	ErrResourceDeleting    = errors.New("resource is being deleted; resume is not allowed")
+	ErrFailureVersionStale = errors.New("resource changed since the failed run; trigger a new run")
+	ErrResumeStepRemoved   = errors.New("failed pipeline step no longer exists with an unchanged prefix; trigger a new run")
+)
+
+// Clock allows tests to control timestamps written into resource metadata.
+type Clock interface {
+	Now() time.Time
+}
+
+type realClock struct{}
+
+func (realClock) Now() time.Time { return time.Now() }
+
+// PipelineFailure records where and why a non-deletion pipeline run stopped.
+type PipelineFailure struct {
+	RunID    string `json:"run_id"`
+	StepID   string `json:"step_id"`
+	Message  string `json:"message"`
+	FailedAt string `json:"failed_at"`
+	Version  string `json:"version"`
+}
+
+// StepSignature captures the identity of a successfully completed step so a
+// resume can detect pipeline definition changes made after the failure.
+type StepSignature struct {
+	StepID string `json:"step_id"`
+	Driver string `json:"driver"`
+}
+
+// StepResultRecord is the ordered, per-step source of truth for driver results.
+// driverresults remains a driver-keyed view rebuilt from these records.
+type StepResultRecord struct {
+	StepID string      `json:"step_id"`
+	Driver string      `json:"driver"`
+	Result interface{} `json:"result"`
+}
+
+// ResumePlan is the outcome of preparing a resource for a continued run.
+type ResumePlan struct {
+	Resource     types.Resource
+	RunID        string
+	ResumeStepID string
+	ResumeEvent  string
+	RestartIndex int
+}
+
 func (m *ResourceModel) lockMutation(name, resourceType string) func() {
 	value, _ := resourceMutationLocks.LoadOrStore(resourceLockKey{m.DB, m.key(name, resourceType)}, &sync.Mutex{})
 	mutex := value.(*sync.Mutex)
@@ -28,13 +90,50 @@ func (m *ResourceModel) lockMutation(name, resourceType string) func() {
 	return mutex.Unlock
 }
 
+func (m *ResourceModel) clock() Clock {
+	if m.Clock != nil {
+		return m.Clock
+	}
+	return realClock{}
+}
+
+// persist marshals and writes a resource back under its primary key.
+func (m *ResourceModel) persist(name, resourceType string, resource types.Resource) error {
+	data, err := json.Marshal(resource)
+	if err != nil {
+		return fmt.Errorf("failed to marshal updated resource: %v", err)
+	}
+	return m.DB.Update(func(txn *badger.Txn) error {
+		return txn.Set([]byte(m.key(name, resourceType)), data)
+	})
+}
+
+// decodeMetadataValue converts a metadata value (which JSON round-tripping may
+// represent as map[string]interface{}/[]interface{}) into a typed target.
+func decodeMetadataValue(value, target interface{}) error {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(data, target)
+}
+
+func metaString(value interface{}) string {
+	if s, ok := value.(string); ok {
+		return s
+	}
+	return ""
+}
+
 type ResourceModel struct {
-	DB *badger.DB
+	DB    *badger.DB
+	Clock Clock
 }
 
 func NewResourceModel(db *badger.DB) *ResourceModel {
 	return &ResourceModel{
-		DB: db,
+		DB:    db,
+		Clock: realClock{},
 	}
 }
 
@@ -454,6 +553,8 @@ func (m *ResourceModel) SetCurrentPipelineStep(name string, resourceType string,
 // StartPipelineRun resets execution metadata without discarding resource metadata.
 // Driver results belong to one run; retaining them makes a retry inherit failures.
 func (m *ResourceModel) StartPipelineRun(name, resourceType, runID, event, stepID string) (types.Resource, error) {
+	unlock := m.lockMutation(name, resourceType)
+	defer unlock()
 	var resource types.Resource
 	key := []byte(m.key(name, resourceType))
 	err := m.DB.Update(func(txn *badger.Txn) error {
@@ -467,10 +568,14 @@ func (m *ResourceModel) StartPipelineRun(name, resourceType, runID, event, stepI
 		if resource.Metadata == nil {
 			resource.Metadata = make(map[string]interface{})
 		}
-		resource.Metadata["driverresults"] = make(map[string]interface{})
-		resource.Metadata["current_pipeline_run"] = runID
-		resource.Metadata["current_pipeline_event"] = event
-		resource.Metadata["current_pipeline_step"] = stepID
+		resource.Metadata[metaDriverResults] = make(map[string]interface{})
+		resource.Metadata[metaCurrentRun] = runID
+		resource.Metadata[metaCurrentEvent] = event
+		resource.Metadata[metaCurrentStep] = stepID
+		// A fresh run must not inherit a previous failure or step bookkeeping.
+		delete(resource.Metadata, metaPipelineFailure)
+		delete(resource.Metadata, metaStepSignatures)
+		delete(resource.Metadata, metaStepResults)
 		data, err := json.Marshal(resource)
 		if err != nil {
 			return err
@@ -516,7 +621,7 @@ func (m *ResourceModel) BeginDeletion(name, resourceType string) (types.Resource
 	}
 	resource.Metadata["deleting"] = true
 	resource.Metadata["deletion_runid"] = uuid.New().String()
-	resource.Metadata["deletion_started_at"] = time.Now().UTC().Format(time.RFC3339Nano)
+	resource.Metadata["deletion_started_at"] = m.clock().Now().UTC().Format(time.RFC3339Nano)
 	delete(resource.Metadata, "deletion_failed")
 	data, err := json.Marshal(resource)
 	if err != nil {
@@ -549,4 +654,218 @@ func DeletionRunning(resource types.Resource) bool {
 	started, _ := resource.Metadata["deletion_started_at"].(string)
 	at, err := time.Parse(time.RFC3339Nano, started)
 	return err == nil && time.Since(at) < 2*time.Minute
+}
+
+// MarkPipelineFailure records a failed non-deletion step. It is a no-op when the
+// stored run no longer matches, so late results from a superseded run cannot
+// overwrite the current run's state.
+func (m *ResourceModel) MarkPipelineFailure(name, resourceType, runID, stepID, message string) error {
+	unlock := m.lockMutation(name, resourceType)
+	defer unlock()
+	resource, err := m.FindOne(name, resourceType)
+	if err != nil {
+		return err
+	}
+	if current, ok := resource.Metadata[metaCurrentRun].(string); ok && current != runID {
+		return nil
+	}
+	if resource.Metadata == nil {
+		resource.Metadata = make(map[string]interface{})
+	}
+	failure := PipelineFailure{
+		RunID:    runID,
+		StepID:   stepID,
+		Message:  message,
+		FailedAt: m.clock().Now().UTC().Format(time.RFC3339Nano),
+		Version:  metaString(resource.Metadata[metaVersion]),
+	}
+	resource.Metadata[metaPipelineFailure] = failure
+	return m.persist(name, resourceType, resource)
+}
+
+// ClearPipelineFailure removes any failure marker without touching other state.
+func (m *ResourceModel) ClearPipelineFailure(name, resourceType string) error {
+	unlock := m.lockMutation(name, resourceType)
+	defer unlock()
+	resource, err := m.FindOne(name, resourceType)
+	if err != nil {
+		return err
+	}
+	delete(resource.Metadata, metaPipelineFailure)
+	return m.persist(name, resourceType, resource)
+}
+
+// FinishPipelineRun clears run bookkeeping after a fully successful run. Driver
+// results are retained until the next StartPipelineRun, matching prior behavior.
+func (m *ResourceModel) FinishPipelineRun(name, resourceType string) error {
+	unlock := m.lockMutation(name, resourceType)
+	defer unlock()
+	resource, err := m.FindOne(name, resourceType)
+	if err != nil {
+		return err
+	}
+	delete(resource.Metadata, metaPipelineFailure)
+	delete(resource.Metadata, metaStepSignatures)
+	delete(resource.Metadata, metaStepResults)
+	return m.persist(name, resourceType, resource)
+}
+
+// RecordStepResult stores a successful step: the driver-keyed result view, the
+// ordered per-step record, and the completion signature, in one transaction.
+func (m *ResourceModel) RecordStepResult(name, resourceType, stepID, driver string, result interface{}) error {
+	unlock := m.lockMutation(name, resourceType)
+	defer unlock()
+	resource, err := m.FindOne(name, resourceType)
+	if err != nil {
+		return fmt.Errorf("failed to find resource: %v", err)
+	}
+	if resource.Metadata == nil {
+		resource.Metadata = make(map[string]interface{})
+	}
+
+	driverResults := make(map[string]interface{})
+	if existing, ok := resource.Metadata[metaDriverResults].(map[string]interface{}); ok {
+		driverResults = existing
+	}
+	driverResults[driver] = result
+	resource.Metadata[metaDriverResults] = driverResults
+
+	var records []StepResultRecord
+	if err := decodeMetadataValue(resource.Metadata[metaStepResults], &records); err != nil {
+		return fmt.Errorf("failed to decode step results: %v", err)
+	}
+	upserted := false
+	for i := range records {
+		if records[i].StepID == stepID {
+			records[i] = StepResultRecord{StepID: stepID, Driver: driver, Result: result}
+			upserted = true
+			break
+		}
+	}
+	if !upserted {
+		records = append(records, StepResultRecord{StepID: stepID, Driver: driver, Result: result})
+	}
+	resource.Metadata[metaStepResults] = records
+
+	var signatures []StepSignature
+	if err := decodeMetadataValue(resource.Metadata[metaStepSignatures], &signatures); err != nil {
+		return fmt.Errorf("failed to decode step signatures: %v", err)
+	}
+	alreadySigned := false
+	for _, sig := range signatures {
+		if sig.StepID == stepID {
+			alreadySigned = true
+			break
+		}
+	}
+	if !alreadySigned {
+		signatures = append(signatures, StepSignature{StepID: stepID, Driver: driver})
+	}
+	resource.Metadata[metaStepSignatures] = signatures
+
+	return m.persist(name, resourceType, resource)
+}
+
+// computeRestartIndex returns the position of the first step whose recorded
+// signature no longer matches the current pipeline definition. A fully matching
+// prefix yields len(signatures), i.e. execution resumes after the prefix.
+func computeRestartIndex(signatures []StepSignature, steps []types.Step) int {
+	for i, sig := range signatures {
+		if i >= len(steps) || steps[i].ID != sig.StepID || steps[i].Driver != sig.Driver {
+			return i
+		}
+	}
+	return len(signatures)
+}
+
+// PreparePipelineResume validates a resume request and rewrites execution
+// metadata so the run continues from the first step whose result cannot be
+// trusted. The pipeline definition is supplied by the caller; this method only
+// mutates resource state, all under the per-resource mutation lock.
+func (m *ResourceModel) PreparePipelineResume(name, resourceType string, pipeline *types.Pipeline) (ResumePlan, error) {
+	unlock := m.lockMutation(name, resourceType)
+	defer unlock()
+
+	resource, err := m.FindOne(name, resourceType)
+	if err != nil {
+		return ResumePlan{}, err
+	}
+	if resource.Metadata == nil {
+		resource.Metadata = make(map[string]interface{})
+	}
+	if resource.Metadata["deleting"] == true {
+		return ResumePlan{}, ErrResourceDeleting
+	}
+
+	var failure PipelineFailure
+	if err := decodeMetadataValue(resource.Metadata[metaPipelineFailure], &failure); err != nil || failure.StepID == "" {
+		return ResumePlan{}, ErrNoPipelineFailure
+	}
+
+	currentVersion, err := strconv.Atoi(metaString(resource.Metadata[metaVersion]))
+	failedVersion, parseErr := strconv.Atoi(failure.Version)
+	if err != nil || parseErr != nil || currentVersion > failedVersion {
+		return ResumePlan{}, ErrFailureVersionStale
+	}
+
+	event, ok := resource.Metadata[metaCurrentEvent].(string)
+	if !ok || event == "" {
+		return ResumePlan{}, errors.New("missing pipeline operation for the failed run")
+	}
+
+	var signatures []StepSignature
+	if err := decodeMetadataValue(resource.Metadata[metaStepSignatures], &signatures); err != nil {
+		return ResumePlan{}, fmt.Errorf("failed to decode step signatures: %v", err)
+	}
+	restartIndex := computeRestartIndex(signatures, pipeline.Steps)
+	if restartIndex >= len(pipeline.Steps) {
+		return ResumePlan{}, ErrResumeStepRemoved
+	}
+
+	failedStepIndex := -1
+	for i, step := range pipeline.Steps {
+		if step.ID == failure.StepID {
+			failedStepIndex = i
+			break
+		}
+	}
+	if failedStepIndex < 0 || failedStepIndex < restartIndex {
+		return ResumePlan{}, ErrResumeStepRemoved
+	}
+
+	var records []StepResultRecord
+	if err := decodeMetadataValue(resource.Metadata[metaStepResults], &records); err != nil {
+		return ResumePlan{}, fmt.Errorf("failed to decode step results: %v", err)
+	}
+	if restartIndex < len(records) {
+		records = records[:restartIndex]
+	}
+	// Rebuild the driver-keyed view from the trusted prefix only, so results
+	// from repeated driver names cannot leak in from discarded steps.
+	rebuiltResults := make(map[string]interface{})
+	for _, record := range records {
+		rebuiltResults[record.Driver] = record.Result
+	}
+	resource.Metadata[metaDriverResults] = rebuiltResults
+	resource.Metadata[metaStepResults] = records
+	if restartIndex < len(signatures) {
+		signatures = signatures[:restartIndex]
+	}
+	resource.Metadata[metaStepSignatures] = signatures
+
+	runID := uuid.New().String()
+	delete(resource.Metadata, metaPipelineFailure)
+	resource.Metadata[metaCurrentRun] = runID
+	resource.Metadata[metaCurrentStep] = pipeline.Steps[restartIndex].ID
+
+	if err := m.persist(name, resourceType, resource); err != nil {
+		return ResumePlan{}, err
+	}
+	return ResumePlan{
+		Resource:     resource,
+		RunID:        runID,
+		ResumeStepID: pipeline.Steps[restartIndex].ID,
+		ResumeEvent:  event,
+		RestartIndex: restartIndex,
+	}, nil
 }
